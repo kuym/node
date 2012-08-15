@@ -1,5 +1,8 @@
-Evented I/O for V8 javascript. [![Build Status](https://secure.travis-ci.org/joyent/node.png)](http://travis-ci.org/joyent/node)
+Evented I/O for V8 javascript. Do not use this version.
 ===
+
+This fork of node has been hastily patched to add daemonizing options for Unix and Mac.
+Run ./node -h for options.
 
 ### To build:
 
