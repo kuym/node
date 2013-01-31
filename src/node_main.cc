@@ -108,7 +108,7 @@ int main(int argc, char *argv[])
 	bool daemonize = false;
 	//scan argv for these options and remove them from the list
 	int argIdx;
-	if(((argIdx = indexOfArgument(argc, args, "-d")) != -1) || ((argIdx = indexOfArgument(argc, args, "--daemonize")) != -1))
+	if(((argIdx = indexOfArgument(argc, args, "-D")) != -1) || ((argIdx = indexOfArgument(argc, args, "--daemonize")) != -1))
 	{
 		daemonize = true;
 		argc = removeArgument(argc, args, argIdx);

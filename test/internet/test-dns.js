@@ -221,7 +221,7 @@ TEST(function test_resolveSrv(done) {
 
 
 TEST(function test_resolveCname(done) {
-  var req = dns.resolveCname('www.google.com', function(err, names) {
+  var req = dns.resolveCname('www.microsoft.com', function(err, names) {
     if (err) throw err;
 
     assert.ok(names.length > 0);
@@ -308,6 +308,7 @@ TEST(function test_lookup_failure(done) {
     assert.ok(err instanceof Error);
     assert.strictEqual(err.errno, dns.NOTFOUND);
     assert.strictEqual(err.errno, 'ENOTFOUND');
+    assert.ok(!/ENOENT/.test(err.message));
 
     done();
   });

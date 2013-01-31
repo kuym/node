@@ -30,6 +30,7 @@
 
 #include <net/if.h>
 #include <sys/param.h>
+#include <sys/prctl.h>
 #include <sys/sysinfo.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -56,22 +57,210 @@
 # define CLOCK_BOOTTIME 7
 #endif
 
-static char buf[MAXPATHLEN + 1];
+static void* args_mem;
 
 static struct {
   char *str;
   size_t len;
 } process_title;
 
+static void read_models(unsigned int numcpus, uv_cpu_info_t* ci);
+static void read_speeds(unsigned int numcpus, uv_cpu_info_t* ci);
+static void read_times(unsigned int numcpus, uv_cpu_info_t* ci);
+static unsigned long read_cpufreq(unsigned int cpunum);
 
-/*
- * There's probably some way to get time from Linux than gettimeofday(). What
- * it is, I don't know.
- */
-uint64_t uv_hrtime() {
+
+__attribute__((destructor))
+static void free_args_mem(void) {
+  free(args_mem); /* keep valgrind happy */
+}
+
+
+int uv__platform_loop_init(uv_loop_t* loop, int default_loop) {
+  int fd;
+
+  fd = uv__epoll_create1(UV__EPOLL_CLOEXEC);
+
+  /* epoll_create1() can fail either because it's not implemented (old kernel)
+   * or because it doesn't understand the EPOLL_CLOEXEC flag.
+   */
+  if (fd == -1 && (errno == ENOSYS || errno == EINVAL)) {
+    fd = uv__epoll_create(256);
+
+    if (fd != -1)
+      uv__cloexec(fd, 1);
+  }
+
+  loop->backend_fd = fd;
+  loop->inotify_fd = -1;
+  loop->inotify_watchers = NULL;
+
+  if (fd == -1)
+    return -1;
+
+  return 0;
+}
+
+
+void uv__platform_loop_delete(uv_loop_t* loop) {
+  if (loop->inotify_fd == -1) return;
+  uv__io_stop(loop, &loop->inotify_read_watcher, UV__POLLIN);
+  close(loop->inotify_fd);
+  loop->inotify_fd = -1;
+}
+
+
+void uv__io_poll(uv_loop_t* loop, int timeout) {
+  struct uv__epoll_event events[1024];
+  struct uv__epoll_event* pe;
+  struct uv__epoll_event e;
+  ngx_queue_t* q;
+  uv__io_t* w;
+  uint64_t base;
+  uint64_t diff;
+  int nevents;
+  int count;
+  int nfds;
+  int fd;
+  int op;
+  int i;
+
+  if (loop->nfds == 0) {
+    assert(ngx_queue_empty(&loop->watcher_queue));
+    return;
+  }
+
+  while (!ngx_queue_empty(&loop->watcher_queue)) {
+    q = ngx_queue_head(&loop->watcher_queue);
+    ngx_queue_remove(q);
+    ngx_queue_init(q);
+
+    w = ngx_queue_data(q, uv__io_t, watcher_queue);
+    assert(w->pevents != 0);
+    assert(w->fd >= 0);
+    assert(w->fd < (int) loop->nwatchers);
+
+    /* Filter out no-op changes. This is for compatibility with the event ports
+     * backend, see the comment in uv__io_start().
+     */
+    if (w->events == w->pevents)
+      continue;
+
+    e.events = w->pevents;
+    e.data = w->fd;
+
+    if (w->events == 0)
+      op = UV__EPOLL_CTL_ADD;
+    else
+      op = UV__EPOLL_CTL_MOD;
+
+    /* XXX Future optimization: do EPOLL_CTL_MOD lazily if we stop watching
+     * events, skip the syscall and squelch the events after epoll_wait().
+     */
+    if (uv__epoll_ctl(loop->backend_fd, op, w->fd, &e)) {
+      if (errno != EEXIST)
+        abort();
+
+      assert(op == UV__EPOLL_CTL_ADD);
+
+      /* We've reactivated a file descriptor that's been watched before. */
+      if (uv__epoll_ctl(loop->backend_fd, UV__EPOLL_CTL_MOD, w->fd, &e))
+        abort();
+    }
+
+    w->events = w->pevents;
+  }
+
+  assert(timeout >= -1);
+  base = loop->time;
+  count = 48; /* Benchmarks suggest this gives the best throughput. */
+
+  for (;;) {
+    nfds = uv__epoll_wait(loop->backend_fd,
+                          events,
+                          ARRAY_SIZE(events),
+                          timeout);
+
+    /* Update loop->time unconditionally. It's tempting to skip the update when
+     * timeout == 0 (i.e. non-blocking poll) but there is no guarantee that the
+     * operating system didn't reschedule our process while in the syscall.
+     */
+    SAVE_ERRNO(uv__update_time(loop));
+
+    if (nfds == 0) {
+      assert(timeout != -1);
+      return;
+    }
+
+    if (nfds == -1) {
+      if (errno != EINTR)
+        abort();
+
+      if (timeout == -1)
+        continue;
+
+      if (timeout == 0)
+        return;
+
+      /* Interrupted by a signal. Update timeout and poll again. */
+      goto update_timeout;
+    }
+
+    nevents = 0;
+
+    for (i = 0; i < nfds; i++) {
+      pe = events + i;
+      fd = pe->data;
+
+      assert(fd >= 0);
+      assert((unsigned) fd < loop->nwatchers);
+
+      w = loop->watchers[fd];
+
+      if (w == NULL) {
+        /* File descriptor that we've stopped watching, disarm it. */
+        if (uv__epoll_ctl(loop->backend_fd, UV__EPOLL_CTL_DEL, fd, pe))
+          if (errno != EBADF && errno != ENOENT)
+            abort();
+
+        continue;
+      }
+
+      w->cb(loop, w, pe->events);
+      nevents++;
+    }
+
+    if (nevents != 0) {
+      if (nfds == ARRAY_SIZE(events) && --count != 0) {
+        /* Poll for more events but don't block this time. */
+        timeout = 0;
+        continue;
+      }
+      return;
+    }
+
+    if (timeout == 0)
+      return;
+
+    if (timeout == -1)
+      continue;
+
+update_timeout:
+    assert(timeout > 0);
+
+    diff = loop->time - base;
+    if (diff >= (uint64_t) timeout)
+      return;
+
+    timeout -= diff;
+  }
+}
+
+
+uint64_t uv__hrtime(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (ts.tv_sec * NANOSEC + ts.tv_nsec);
+  return (((uint64_t) ts.tv_sec) * NANOSEC + ts.tv_nsec);
 }
 
 
@@ -131,11 +320,12 @@ char** uv_setup_args(int argc, char** argv) {
   size += (argc + 1) * sizeof(char **);
   size += (envc + 1) * sizeof(char **);
 
-  if ((s = (char *) malloc(size)) == NULL) {
+  if (NULL == (s = malloc(size))) {
     process_title.str = NULL;
     process_title.len = 0;
     return argv;
   }
+  args_mem = s;
 
   new_argv = (char **) s;
   new_env = new_argv + argc + 1;
@@ -162,6 +352,10 @@ uv_err_t uv_set_process_title(const char* title) {
   if (process_title.len)
     strncpy(process_title.str, title, process_title.len - 1);
 
+#if defined(PR_SET_NAME)
+  prctl(PR_SET_NAME, title);
+#endif
+
   return uv_ok_;
 }
 
@@ -187,6 +381,7 @@ uv_err_t uv_resident_set_memory(size_t* rss) {
   size_t page_size = getpagesize();
   char *cbuf;
   int foundExeEnd;
+  char buf[PATH_MAX + 1];
 
   f = fopen("/proc/self/stat", "r");
   if (!f) return uv__new_sys_error(errno);
@@ -301,81 +496,206 @@ uv_err_t uv_uptime(double* uptime) {
 
 
 uv_err_t uv_cpu_info(uv_cpu_info_t** cpu_infos, int* count) {
-  unsigned int ticks = (unsigned int)sysconf(_SC_CLK_TCK),
-               multiplier = ((uint64_t)1000L / ticks), cpuspeed;
-  int numcpus = 0, i = 0;
-  unsigned long ticks_user, ticks_sys, ticks_idle, ticks_nice, ticks_intr;
-  char line[512], speedPath[256], model[512];
-  FILE *fpStat = fopen("/proc/stat", "r");
-  FILE *fpModel = fopen("/proc/cpuinfo", "r");
-  FILE *fpSpeed;
-  uv_cpu_info_t* cpu_info;
+  unsigned int numcpus;
+  uv_cpu_info_t* ci;
 
-  if (fpModel) {
-    while (fgets(line, 511, fpModel) != NULL) {
-      if (strncmp(line, "model name", 10) == 0) {
-        numcpus++;
-        if (numcpus == 1) {
-          char *p = strchr(line, ':') + 2;
-          strcpy(model, p);
-          model[strlen(model)-1] = 0;
-        }
-      } else if (strncmp(line, "cpu MHz", 7) == 0) {
-        if (numcpus == 1) {
-          sscanf(line, "%*s %*s : %u", &cpuspeed);
-        }
-      }
-    }
-    fclose(fpModel);
-  }
+  *cpu_infos = NULL;
+  *count = 0;
 
-  *cpu_infos = (uv_cpu_info_t*)malloc(numcpus * sizeof(uv_cpu_info_t));
-  if (!(*cpu_infos)) {
-    return uv__new_artificial_error(UV_ENOMEM);
-  }
+  numcpus = sysconf(_SC_NPROCESSORS_ONLN);
+  assert(numcpus != (unsigned int) -1);
+  assert(numcpus != 0);
 
+  ci = calloc(numcpus, sizeof(*ci));
+  if (ci == NULL)
+    return uv__new_sys_error(ENOMEM);
+
+  read_models(numcpus, ci);
+  read_times(numcpus, ci);
+
+  /* read_models() on x86 also reads the CPU speed from /proc/cpuinfo */
+  if (ci[0].speed == 0)
+    read_speeds(numcpus, ci);
+
+  *cpu_infos = ci;
   *count = numcpus;
 
-  cpu_info = *cpu_infos;
+  return uv_ok_;
+}
 
-  if (fpStat) {
-    while (fgets(line, 511, fpStat) != NULL) {
-      if (strncmp(line, "cpu ", 4) == 0) {
-        continue;
-      } else if (strncmp(line, "cpu", 3) != 0) {
-        break;
-      }
 
-      sscanf(line, "%*s %lu %lu %lu %lu %*s %lu",
-             &ticks_user, &ticks_nice, &ticks_sys, &ticks_idle, &ticks_intr);
-      snprintf(speedPath, sizeof(speedPath),
-               "/sys/devices/system/cpu/cpu%u/cpufreq/cpuinfo_max_freq", i);
+static void read_speeds(unsigned int numcpus, uv_cpu_info_t* ci) {
+  unsigned int num;
 
-      fpSpeed = fopen(speedPath, "r");
+  for (num = 0; num < numcpus; num++)
+    ci[num].speed = read_cpufreq(num) / 1000;
+}
 
-      if (fpSpeed) {
-        if (fgets(line, 511, fpSpeed) != NULL) {
-          sscanf(line, "%u", &cpuspeed);
-          cpuspeed /= 1000;
-        }
-        fclose(fpSpeed);
-      }
 
-      cpu_info->cpu_times.user = ticks_user * multiplier;
-      cpu_info->cpu_times.nice = ticks_nice * multiplier;
-      cpu_info->cpu_times.sys = ticks_sys * multiplier;
-      cpu_info->cpu_times.idle = ticks_idle * multiplier;
-      cpu_info->cpu_times.irq = ticks_intr * multiplier;
+/* Also reads the CPU frequency on x86. The other architectures only have
+ * a BogoMIPS field, which may not be very accurate.
+ */
+static void read_models(unsigned int numcpus, uv_cpu_info_t* ci) {
+#if defined(__i386__) || defined(__x86_64__)
+  static const char model_marker[] = "model name\t: ";
+  static const char speed_marker[] = "cpu MHz\t\t: ";
+#elif defined(__arm__)
+  static const char model_marker[] = "Processor\t: ";
+  static const char speed_marker[] = "";
+#elif defined(__mips__)
+  static const char model_marker[] = "cpu model\t\t: ";
+  static const char speed_marker[] = "";
+#else
+# warning uv_cpu_info() is not supported on this architecture.
+  static const char model_marker[] = "";
+  static const char speed_marker[] = "";
+#endif
+  static const char bogus_model[] = "unknown";
+  unsigned int model_idx;
+  unsigned int speed_idx;
+  char buf[1024];
+  char* model;
+  FILE* fp;
+  char* inferred_model;
 
-      cpu_info->model = strdup(model);
-      cpu_info->speed = cpuspeed;
+  fp = fopen("/proc/cpuinfo", "r");
+  if (fp == NULL)
+    return;
 
-      cpu_info++;
+  model_idx = 0;
+  speed_idx = 0;
+
+  while (fgets(buf, sizeof(buf), fp)) {
+    if (model_marker[0] != '\0' &&
+        model_idx < numcpus &&
+        strncmp(buf, model_marker, sizeof(model_marker) - 1) == 0)
+    {
+      model = buf + sizeof(model_marker) - 1;
+      model = strndup(model, strlen(model) - 1); /* strip newline */
+      ci[model_idx++].model = model;
+      continue;
     }
-    fclose(fpStat);
+
+    if (speed_marker[0] != '\0' &&
+        speed_idx < numcpus &&
+        strncmp(buf, speed_marker, sizeof(speed_marker) - 1) == 0)
+    {
+      ci[speed_idx++].speed = atoi(buf + sizeof(speed_marker) - 1);
+      continue;
+    }
+  }
+  fclose(fp);
+
+  /* Now we want to make sure that all the models contain *something*:
+   * it's not safe to leave them as null.
+   */
+  if (model_idx == 0) {
+    /* No models at all: fake up the first one. */
+    ci[0].model = strndup(bogus_model, sizeof(bogus_model) - 1);
+    model_idx = 1;
   }
 
-  return uv_ok_;
+  /* Not enough models, but we do have at least one.  So we'll just
+   * copy the rest down: it might be better to indicate somehow that
+   * the remaining ones have been guessed.
+   */
+  inferred_model = ci[model_idx - 1].model;
+
+  while (model_idx < numcpus) {
+    ci[model_idx].model = strndup(inferred_model, strlen(inferred_model));
+    model_idx++;
+  }
+}
+
+
+static void read_times(unsigned int numcpus, uv_cpu_info_t* ci) {
+  unsigned long clock_ticks;
+  struct uv_cpu_times_s ts;
+  unsigned long user;
+  unsigned long nice;
+  unsigned long sys;
+  unsigned long idle;
+  unsigned long dummy;
+  unsigned long irq;
+  unsigned int num;
+  unsigned int len;
+  char buf[1024];
+  FILE* fp;
+
+  clock_ticks = sysconf(_SC_CLK_TCK);
+  assert(clock_ticks != (unsigned long) -1);
+  assert(clock_ticks != 0);
+
+  fp = fopen("/proc/stat", "r");
+  if (fp == NULL)
+    return;
+
+  if (!fgets(buf, sizeof(buf), fp))
+    abort();
+
+  num = 0;
+
+  while (fgets(buf, sizeof(buf), fp)) {
+    if (num >= numcpus)
+      break;
+
+    if (strncmp(buf, "cpu", 3))
+      break;
+
+    /* skip "cpu<num> " marker */
+    {
+      unsigned int n = num;
+      for (len = sizeof("cpu0"); n /= 10; len++);
+      assert(sscanf(buf, "cpu%u ", &n) == 1 && n == num);
+    }
+
+    /* Line contains user, nice, system, idle, iowait, irq, softirq, steal,
+     * guest, guest_nice but we're only interested in the first four + irq.
+     *
+     * Don't use %*s to skip fields or %ll to read straight into the uint64_t
+     * fields, they're not allowed in C89 mode.
+     */
+    if (6 != sscanf(buf + len,
+                    "%lu %lu %lu %lu %lu %lu",
+                    &user,
+                    &nice,
+                    &sys,
+                    &idle,
+                    &dummy,
+                    &irq))
+      abort();
+
+    ts.user = clock_ticks * user;
+    ts.nice = clock_ticks * nice;
+    ts.sys  = clock_ticks * sys;
+    ts.idle = clock_ticks * idle;
+    ts.irq  = clock_ticks * irq;
+    ci[num++].cpu_times = ts;
+  }
+  fclose(fp);
+}
+
+
+static unsigned long read_cpufreq(unsigned int cpunum) {
+  unsigned long val;
+  char buf[1024];
+  FILE* fp;
+
+  snprintf(buf,
+           sizeof(buf),
+           "/sys/devices/system/cpu/cpu%u/cpufreq/scaling_cur_freq",
+           cpunum);
+
+  fp = fopen(buf, "r");
+  if (fp == NULL)
+    return 0;
+
+  if (fscanf(fp, "%lu", &val) != 1)
+    val = 0;
+
+  fclose(fp);
+
+  return val;
 }
 
 

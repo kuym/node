@@ -26,6 +26,15 @@
 #include "v8.h"
 #include <assert.h>
 
+// Explicitly instantiate some template classes, so we're sure they will be
+// present in the binary / shared object. There isn't much doubt that they will
+// be, but MSVC tends to complain about these things.
+#ifdef _MSC_VER
+  template class NODE_EXTERN v8::Persistent<v8::Object>;
+  template class NODE_EXTERN v8::Persistent<v8::FunctionTemplate>;
+#endif
+
+
 namespace node {
 
 class NODE_EXTERN ObjectWrap {
@@ -50,7 +59,7 @@ class NODE_EXTERN ObjectWrap {
   static inline T* Unwrap (v8::Handle<v8::Object> handle) {
     assert(!handle.IsEmpty());
     assert(handle->InternalFieldCount() > 0);
-    return static_cast<T*>(handle->GetPointerFromInternalField(0));
+    return static_cast<T*>(handle->GetAlignedPointerFromInternalField(0));
   }
 
 
@@ -61,7 +70,7 @@ class NODE_EXTERN ObjectWrap {
     assert(handle_.IsEmpty());
     assert(handle->InternalFieldCount() > 0);
     handle_ = v8::Persistent<v8::Object>::New(handle);
-    handle_->SetPointerInInternalField(0, this);
+    handle_->SetAlignedPointerInInternalField(0, this);
     MakeWeak();
   }
 
@@ -103,6 +112,8 @@ class NODE_EXTERN ObjectWrap {
 
  private:
   static void WeakCallback (v8::Persistent<v8::Value> value, void *data) {
+    v8::HandleScope scope;
+
     ObjectWrap *obj = static_cast<ObjectWrap*>(data);
     assert(value == obj->handle_);
     assert(!obj->refs_);

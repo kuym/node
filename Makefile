@@ -2,6 +2,7 @@
 
 BUILDTYPE ?= Release
 PYTHON ?= python
+NINJA ?= ninja
 DESTDIR ?=
 SIGN ?=
 
@@ -22,22 +23,34 @@ endif
 # to check for changes.
 .PHONY: node node_g
 
+ifeq ($(USE_NINJA),1)
 node: config.gypi
-	$(MAKE) -C out BUILDTYPE=Release V=$(V)
+	$(NINJA) -C out/Release/
 	ln -fs out/Release/node node
 
 node_g: config.gypi
-	$(MAKE) -C out BUILDTYPE=Debug V=$(V)
-	ln -fs out/Debug/node node_g
+	$(NINJA) -C out/Debug/
+	ln -fs out/Debug/node $@
+else
+node: config.gypi out/Makefile
+	$(MAKE) -C out BUILDTYPE=Release V=$(V)
+	ln -fs out/Release/node node
 
-config.gypi: configure
-	./configure
-
-out/Debug/node:
+node_g: config.gypi out/Makefile
 	$(MAKE) -C out BUILDTYPE=Debug V=$(V)
+	ln -fs out/Debug/node $@
+endif
 
 out/Makefile: common.gypi deps/uv/uv.gyp deps/http_parser/http_parser.gyp deps/zlib/zlib.gyp deps/v8/build/common.gypi deps/v8/tools/gyp/v8.gyp node.gyp config.gypi
+ifeq ($(USE_NINJA),1)
+	touch out/Makefile
+	$(PYTHON) tools/gyp_node -f ninja
+else
 	$(PYTHON) tools/gyp_node -f make
+endif
+
+config.gypi: configure
+	$(PYTHON) ./configure
 
 install: all
 	$(PYTHON) tools/install.py $@ $(DESTDIR)
@@ -59,7 +72,7 @@ distclean:
 
 test: all
 	$(PYTHON) tools/test.py --mode=release simple message
-	PYTHONPATH=tools/closure_linter/ $(PYTHON) tools/closure_linter/closure_linter/gjslint.py --unix_mode --strict --nojsdoc -r lib/ -r src/ --exclude_files lib/punycode.js
+	$(MAKE) jslint
 
 test-http1: all
 	$(PYTHON) tools/test.py --mode=release --use-http1 simple message
@@ -114,7 +127,7 @@ apidoc_sources = $(wildcard doc/api/*.markdown)
 apidocs = $(addprefix out/,$(apidoc_sources:.markdown=.html)) \
           $(addprefix out/,$(apidoc_sources:.markdown=.json))
 
-apidoc_dirs = out/doc out/doc/api/ out/doc/api/assets out/doc/about out/doc/community out/doc/logos out/doc/images
+apidoc_dirs = out/doc out/doc/api/ out/doc/api/assets out/doc/about out/doc/community out/doc/download out/doc/logos out/doc/images
 
 apiassets = $(subst api_assets,api/assets,$(addprefix out/,$(wildcard doc/api_assets/*)))
 
@@ -132,6 +145,7 @@ website_files = \
 	out/doc/pipe.css \
 	out/doc/about/index.html \
 	out/doc/community/index.html \
+	out/doc/download/index.html \
 	out/doc/logos/index.html \
 	out/doc/changelog.html \
 	$(doc_images)
@@ -202,7 +216,11 @@ endif
 ifeq ($(DESTCPU),x64)
 ARCH=x64
 else
+ifeq ($(DESTCPU),arm)
+ARCH=arm
+else
 ARCH=x86
+endif
 endif
 TARNAME=node-$(VERSION)
 TARBALL=$(TARNAME).tar.gz
@@ -242,10 +260,10 @@ pkg: $(PKG)
 $(PKG): release-only
 	rm -rf $(PKGDIR)
 	rm -rf out/deps out/Release
-	./configure --prefix=$(PKGDIR)/32/usr/local --without-snapshot --dest-cpu=ia32
+	$(PYTHON) ./configure --prefix=$(PKGDIR)/32/usr/local --without-snapshot --dest-cpu=ia32
 	$(MAKE) install V=$(V)
 	rm -rf out/deps out/Release
-	./configure --prefix=$(PKGDIR)/usr/local --without-snapshot --dest-cpu=x64
+	$(PYTHON) ./configure --prefix=$(PKGDIR)/usr/local --without-snapshot --dest-cpu=x64
 	$(MAKE) install V=$(V)
 	SIGN="$(SIGN)" PKGDIR="$(PKGDIR)" bash tools/osx-codesign.sh
 	lipo $(PKGDIR)/32/usr/local/bin/node \
@@ -277,7 +295,7 @@ tar: $(TARBALL)
 $(BINARYTAR): release-only
 	rm -rf $(BINARYNAME)
 	rm -rf out/deps out/Release
-	./configure --prefix=/ --without-snapshot --dest-cpu=$(DESTCPU)
+	$(PYTHON) ./configure --prefix=/ --without-snapshot --dest-cpu=$(DESTCPU) $(CONFIG_FLAGS)
 	$(MAKE) install DESTDIR=$(BINARYNAME) V=$(V) PORTABLE=1
 	cp README.md $(BINARYNAME)
 	cp LICENSE $(BINARYNAME)

@@ -52,6 +52,8 @@ class TimerWrap : public HandleWrap {
     constructor->SetClassName(String::NewSymbol("Timer"));
 
     NODE_SET_PROTOTYPE_METHOD(constructor, "close", HandleWrap::Close);
+    NODE_SET_PROTOTYPE_METHOD(constructor, "ref", HandleWrap::Ref);
+    NODE_SET_PROTOTYPE_METHOD(constructor, "unref", HandleWrap::Unref);
 
     NODE_SET_PROTOTYPE_METHOD(constructor, "start", Start);
     NODE_SET_PROTOTYPE_METHOD(constructor, "stop", Stop);
@@ -100,7 +102,7 @@ class TimerWrap : public HandleWrap {
 
     if (r) SetErrno(uv_last_error(uv_default_loop()));
 
-    return scope.Close(Integer::New(r));
+    return scope.Close(Integer::New(r, node_isolate));
   }
 
   static Handle<Value> Stop(const Arguments& args) {
@@ -112,7 +114,7 @@ class TimerWrap : public HandleWrap {
 
     if (r) SetErrno(uv_last_error(uv_default_loop()));
 
-    return scope.Close(Integer::New(r));
+    return scope.Close(Integer::New(r, node_isolate));
   }
 
   static Handle<Value> Again(const Arguments& args) {
@@ -124,7 +126,7 @@ class TimerWrap : public HandleWrap {
 
     if (r) SetErrno(uv_last_error(uv_default_loop()));
 
-    return scope.Close(Integer::New(r));
+    return scope.Close(Integer::New(r, node_isolate));
   }
 
   static Handle<Value> SetRepeat(const Arguments& args) {
@@ -136,7 +138,7 @@ class TimerWrap : public HandleWrap {
 
     uv_timer_set_repeat(&wrap->handle_, repeat);
 
-    return scope.Close(Integer::New(0));
+    return scope.Close(Integer::New(0, node_isolate));
   }
 
   static Handle<Value> GetRepeat(const Arguments& args) {
@@ -148,7 +150,7 @@ class TimerWrap : public HandleWrap {
 
     if (repeat < 0) SetErrno(uv_last_error(uv_default_loop()));
 
-    return scope.Close(Integer::New(repeat));
+    return scope.Close(Integer::New(repeat, node_isolate));
   }
 
   static void OnTimeout(uv_timer_t* handle, int status) {
@@ -157,7 +159,7 @@ class TimerWrap : public HandleWrap {
     TimerWrap* wrap = static_cast<TimerWrap*>(handle->data);
     assert(wrap);
 
-    Local<Value> argv[1] = { Integer::New(status) };
+    Local<Value> argv[1] = { Integer::New(status, node_isolate) };
     MakeCallback(wrap->object_, ontimeout_sym, ARRAY_SIZE(argv), argv);
   }
 
